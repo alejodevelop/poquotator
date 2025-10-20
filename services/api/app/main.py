@@ -2,7 +2,8 @@ from fastapi import FastAPI, HTTPException, Body
 from typing import Optional
 from pydantic import BaseModel, Field
 from typing import List, Dict, Optional
-from app.clients.erp import check_inventory, create_quote
+from app.clients.erp import check_inventory_and_pricing, create_quote
+from app.clients.mailer import send_triage_email
 import os, re, requests
 
 
@@ -27,11 +28,13 @@ class IngestResponse(BaseModel):
     items: List[Item]
 
 class ProcessResult(BaseModel):
-    status: str                     # "created" | "incomplete" | "error"
+    status: str
     from_email: str
     subject: str
     items: List[Item] = Field(default_factory=list)
     availability: Dict[str, bool] = Field(default_factory=dict)
+    pricing: Dict[str, float] = Field(default_factory=dict)
+    currency: str = "USD"
     missing: Optional[List[str]] = None
     quote_id: Optional[str] = None
     reason: Optional[str] = None
@@ -112,28 +115,22 @@ def process_latest_email(payload: ProcessInput):
 
     # 3) Disponibilidad (si hay items)
     availability: Dict[str, bool] = {}
+    pricing: Dict[str, float] = {}
+    currency: str = "USD"
+
     if parsed:
         items_payload = [{"sku": it.sku, "qty": it.qty} for it in parsed]
-        # sanity check:
-        if not all(isinstance(x.get("qty"), int) and isinstance(x.get("sku"), str) for x in items_payload):
-            return ProcessResult(
-                status="error",
-                from_email=from_email or "unknown@example.com",
-                subject=subject or "",
-                items=parsed,
-                availability={},
-                reason="Bad payload for inventory.check"
-            )
-
         try:
-            availability = check_inventory(items_payload)  # debe ser dict[str,bool]
+            availability, pricing, currency = check_inventory_and_pricing(items_payload)
         except Exception as e:
             return ProcessResult(
                 status="error",
                 from_email=from_email or "unknown@example.com",
                 subject=subject or "",
                 items=parsed,
-                availability={},
+                availability=availability,
+                pricing=pricing,
+                currency=currency,
                 reason=f"ERP inventory error: {e}",
             )
 
@@ -143,14 +140,40 @@ def process_latest_email(payload: ProcessInput):
         if out_of_stock:
             missing.extend([f"stock:{sku}" for sku in out_of_stock])
 
-    # 4) Si hay faltantes → incomplete
+    # 4) Si hay faltantes → incomplete + email a triage
     if missing:
+        try:
+            send_triage_email(
+                from_email=from_email or "unknown@example.com",
+                subject=subject or "",
+                items=[{"sku": it.sku, "qty": it.qty} for it in parsed],
+                availability=availability,
+                pricing=pricing,
+                currency=currency,
+                missing=missing,
+                customer_id=customer_id,
+            )
+        except Exception as e:
+            return ProcessResult(
+                status="incomplete",
+                from_email=from_email or "unknown@example.com",
+                subject=subject or "",
+                items=parsed,
+                availability=availability,
+                pricing=pricing,
+                currency=currency,
+                missing=missing,
+                reason=f"triage email failed: {e}",
+            )
+
         return ProcessResult(
             status="incomplete",
             from_email=from_email or "unknown@example.com",
             subject=subject or "",
             items=parsed,
             availability=availability,
+            pricing=pricing,
+            currency=currency,
             missing=missing
         )
 
@@ -163,8 +186,11 @@ def process_latest_email(payload: ProcessInput):
             subject=subject or "",
             items=parsed,
             availability=availability,
+            pricing=pricing,
+            currency=currency,
             quote_id=quote_id
         )
+
     except Exception as e:
         return ProcessResult(
             status="error",

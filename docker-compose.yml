@@ -6,6 +6,9 @@ services:
     env_file: .env
     environment:
       APP_PORT: "8000"
+      SMTP_HOST: mailhog
+      SMTP_PORT: "1025"
+      TRIAGE_EMAIL: triage@example.com
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     ports:
       - "8000:8000"
