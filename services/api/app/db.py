@@ -1,8 +1,6 @@
-# services/api/app/db.py
 import os
 import json
 import logging
-import time
 from typing import Any, Dict, List, Optional
 
 import psycopg2
@@ -18,6 +16,13 @@ def init_pool(minconn: int = 1, maxconn: int = 5):
     if _pool is None:
         _pool = SimpleConnectionPool(minconn, maxconn, DATABASE_URL)
         logger.info("DB pool initialized")
+
+def get_pool() -> SimpleConnectionPool:
+    global _pool
+    if _pool is None:
+        init_pool()
+    assert _pool is not None
+    return _pool
 
 def close_pool():
     global _pool
@@ -39,9 +44,8 @@ def log_event(
     quote_id: Optional[str],
     latency_ms: Optional[int],
 ):
-    if _pool is None:
-        raise RuntimeError("DB pool not initialized")
-    conn = _pool.getconn()
+    pool = get_pool()
+    conn = pool.getconn()
     try:
         with conn, conn.cursor() as cur:
             cur.execute(
@@ -66,4 +70,4 @@ def log_event(
                 ),
             )
     finally:
-        _pool.putconn(conn)
+        pool.putconn(conn)

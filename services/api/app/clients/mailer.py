@@ -27,7 +27,6 @@ def send_triage_email(
         return float(pricing.get(it["sku"], 0.0)) * int(it["qty"])
 
     subtotal = sum(line_total(it) for it in available)
-    # impuestos/fees simulados (opcional)
     tax = round(subtotal * 0.0, 2)  # en POC lo dejamos 0
     grand_total = round(subtotal + tax, 2)
 

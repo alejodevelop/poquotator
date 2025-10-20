@@ -18,7 +18,6 @@ class QuoteResponse(BaseModel):
     status: str = "CREATED"
 
 # --- Precio simulado ---
-# catálogo simple; si el SKU no está, calculamos un default
 CATALOG = {
     "Widget A": 12.50,
     "Widget-B": 9.90,
@@ -31,8 +30,6 @@ def price_for(sku: str) -> float:
         return CATALOG[sku]
     # fallback sencillo: base 10 + 0.5 * largo
     return round(10 + 0.5 * len(sku), 2)
-
-# --- Endpoints ---
 
 @app.get("/health")
 def health():

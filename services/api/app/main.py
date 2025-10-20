@@ -1,14 +1,10 @@
-from fastapi import FastAPI, HTTPException, Body
-from typing import Optional
+from fastapi import FastAPI, HTTPException, Body, Query
 from pydantic import BaseModel, Field
 from typing import List, Dict, Optional
 from app.clients.erp import check_inventory_and_pricing, create_quote
 from app.clients.mailer import send_triage_email
-from app.db import init_pool, close_pool, log_event
-from fastapi import Query
-import os, re, requests
-import time
-
+from app.db import init_pool, close_pool, log_event, get_pool
+import os, re, requests, time
 
 app = FastAPI(title="Poquotator API", version="0.1.0")
 
@@ -19,7 +15,6 @@ def _startup():
 @app.on_event("shutdown")
 def _shutdown():
     close_pool()
-
 
 # --- Healthcheck ---
 @app.get("/health")
@@ -53,6 +48,11 @@ class ProcessResult(BaseModel):
 
 class ProcessInput(BaseModel):
     customer_id: str = "prospect-unknown"
+
+class MissingCount(BaseModel):
+    missing: str
+    count: int
+
 
 # --- Parser muy simple ---
 def parse_items(text: str) -> List[Item]:
@@ -100,9 +100,9 @@ def process_latest_email(payload: ProcessInput):
     """
     t0 = time.perf_counter()
     customer_id = payload.customer_id
-    # 1) Reusar la lógica de MailHog que ya tienes en /ingest
+
+    # 1) Leer último email y parsear
     try:
-        # reusa tu función existente o copia aquí el fetch a MAILHOG_API
         r = requests.get(MAILHOG_API, timeout=5)
         r.raise_for_status()
         data = r.json()
@@ -120,13 +120,13 @@ def process_latest_email(payload: ProcessInput):
         raise HTTPException(status_code=502, detail=f"MailHog fetch failed: {e}")
 
     # 2) Validaciones mínimas
-    missing = []
+    missing: List[str] = []
     if not parsed:
         missing.append("items")
     if not customer_id:
         missing.append("customer_id")
 
-    # 3) Disponibilidad (si hay items)
+    # 3) Disponibilidad + precios
     availability: Dict[str, bool] = {}
     pricing: Dict[str, float] = {}
     currency: str = "USD"
@@ -136,7 +136,6 @@ def process_latest_email(payload: ProcessInput):
         try:
             availability, pricing, currency = check_inventory_and_pricing(items_payload)
         except Exception as e:
-
             latency = int((time.perf_counter() - t0) * 1000)
             log_event(
                 from_email=from_email or "unknown@example.com",
@@ -150,7 +149,6 @@ def process_latest_email(payload: ProcessInput):
                 quote_id=None,
                 latency_ms=latency,
             )
-
             return ProcessResult(
                 status="error",
                 from_email=from_email or "unknown@example.com",
@@ -162,13 +160,12 @@ def process_latest_email(payload: ProcessInput):
                 reason=f"ERP inventory error: {e}",
             )
 
-
-        # agrega a missing los SKUs sin stock
+        # faltantes por stock
         out_of_stock = [sku for sku, ok in availability.items() if not ok]
         if out_of_stock:
             missing.extend([f"stock:{sku}" for sku in out_of_stock])
 
-    # 4) Si hay faltantes → incomplete + email a triage
+    # 4) Si hay faltantes → incomplete + email + log
     if missing:
         try:
             send_triage_email(
@@ -182,7 +179,6 @@ def process_latest_email(payload: ProcessInput):
                 customer_id=customer_id,
             )
         except Exception as e:
-
             latency = int((time.perf_counter() - t0) * 1000)
             log_event(
                 from_email=from_email or "unknown@example.com",
@@ -196,7 +192,6 @@ def process_latest_email(payload: ProcessInput):
                 quote_id=None,
                 latency_ms=latency,
             )
-
             return ProcessResult(
                 status="incomplete",
                 from_email=from_email or "unknown@example.com",
@@ -209,6 +204,21 @@ def process_latest_email(payload: ProcessInput):
                 reason=f"triage email failed: {e}",
             )
 
+        # Log de incomplete exitoso
+        latency = int((time.perf_counter() - t0) * 1000)
+        log_event(
+            from_email=from_email or "unknown@example.com",
+            subject=subject or "",
+            items=[{"sku": it.sku, "qty": it.qty} for it in parsed],
+            availability=availability,
+            pricing=pricing,
+            currency=currency,
+            status="incomplete",
+            missing=missing,
+            quote_id=None,
+            latency_ms=latency,
+        )
+
         return ProcessResult(
             status="incomplete",
             from_email=from_email or "unknown@example.com",
@@ -220,7 +230,7 @@ def process_latest_email(payload: ProcessInput):
             missing=missing
         )
 
-    # 5) Todo OK → crear quote
+    # 5) Todo OK → crear quote + log
     try:
         quote_id = create_quote(customer_id, [{"sku": it.sku, "qty": it.qty} for it in parsed])
 
@@ -250,29 +260,40 @@ def process_latest_email(payload: ProcessInput):
         )
 
     except Exception as e:
+        latency = int((time.perf_counter() - t0) * 1000)
+        log_event(
+            from_email=from_email or "unknown@example.com",
+            subject=subject or "",
+            items=[{"sku": it.sku, "qty": it.qty} for it in parsed],
+            availability=availability,
+            pricing=pricing,
+            currency=currency,
+            status="error",
+            missing=None,
+            quote_id=None,
+            latency_ms=latency,
+        )
         return ProcessResult(
             status="error",
             from_email=from_email or "unknown@example.com",
             subject=subject or "",
             items=parsed,
             availability=availability,
+            pricing=pricing,
+            currency=currency,
             reason=f"ERP quote error: {e}",
         )
 
-
+# --- KPIs /metrics ---
 class MetricsOut(BaseModel):
     total: int
     by_status: Dict[str, int]
-    top_missing: List[Dict[str, int]]  # [{"missing":"stock:Widget-B","count":5}, ...]
+    top_missing: List[MissingCount]  # [{"missing":"stock:Widget-B","count":5}, ...]
     avg_latency_ms: float
 
 @app.get("/metrics", response_model=MetricsOut)
 def metrics(limit_top: int = Query(10, ge=1, le=50)):
-    # Consultas rápidas
-    if _pool is None:
-        init_pool()
-    # Acceso al pool desde módulo db
-    from app.db import _pool as pool  # type: ignore
+    pool = get_pool()
 
     total = 0
     by_status: Dict[str, int] = {}
@@ -292,7 +313,6 @@ def metrics(limit_top: int = Query(10, ge=1, le=50)):
             avg = cur.fetchone()[0]
             avg_latency_ms = float(avg) if avg is not None else 0.0
 
-            # Explota missing_json como array de textos y agrupa
             cur.execute("""
                 SELECT m.missing, COUNT(*) AS cnt
                 FROM (
@@ -304,7 +324,7 @@ def metrics(limit_top: int = Query(10, ge=1, le=50)):
                 ORDER BY cnt DESC
                 LIMIT %s
             """, (limit_top,))
-            top_missing = [{"missing": r[0], "count": r[1]} for r in cur.fetchall()]
+            top_missing = [MissingCount(missing=r[0], count=r[1]) for r in cur.fetchall()]
     finally:
         pool.putconn(conn)
 
