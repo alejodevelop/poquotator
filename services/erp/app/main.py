@@ -24,8 +24,7 @@ def health():
     return {"status": "ok"}
 
 @app.post("/inventory/check")
-def check_inventory(items: List[ItemRequest]) -> Dict[str, bool]:
-    # Simulación trivial: todo lo que termine en 'A' está disponible
+def check_inventory(items: List[ItemRequest]) -> Dict[str, Dict[str, bool]]:
     availability = {i.sku: (i.sku.endswith("A")) for i in items}
     return {"availability": availability}
 

@@ -24,8 +24,8 @@
 
 
 ## Next Steps (milestones)
-- [ ] Add validation + Pydantic models for extraction results.
-- [ ] Implement availability check (worker → ERP mock endpoint).
+- [✅] Add validation + Pydantic models for extraction results.
+- [✅] Implement availability check.
 - [ ] If complete data → call `POST /quotes` in ERP mock.
 - [ ] If missing data → post-process to forward email (via SMTP) with partial info.
 - [ ] Add Postgres for logs + metrics.

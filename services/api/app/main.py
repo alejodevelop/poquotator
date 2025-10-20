@@ -1,7 +1,10 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Dict
+from fastapi import FastAPI, HTTPException, Body
+from typing import Optional
+from pydantic import BaseModel, Field
+from typing import List, Dict, Optional
+from app.clients.erp import check_inventory, create_quote
 import os, re, requests
+
 
 app = FastAPI(title="Poquotator API", version="0.1.0")
 
@@ -22,6 +25,19 @@ class IngestResponse(BaseModel):
     from_email: str
     subject: str
     items: List[Item]
+
+class ProcessResult(BaseModel):
+    status: str                     # "created" | "incomplete" | "error"
+    from_email: str
+    subject: str
+    items: List[Item] = Field(default_factory=list)
+    availability: Dict[str, bool] = Field(default_factory=dict)
+    missing: Optional[List[str]] = None
+    quote_id: Optional[str] = None
+    reason: Optional[str] = None
+
+class ProcessInput(BaseModel):
+    customer_id: str = "prospect-unknown"
 
 # --- Parser muy simple ---
 def parse_items(text: str) -> List[Item]:
@@ -61,3 +77,100 @@ def ingest_latest_email():
         subject=subject,
         items=parsed
     )
+
+@app.post("/process-latest", response_model=ProcessResult)
+def process_latest_email(payload: ProcessInput):
+    """
+    Orquesta: lee último email, parsea items, verifica inventario y crea quote si aplica.
+    """
+    customer_id = payload.customer_id
+    # 1) Reusar la lógica de MailHog que ya tienes en /ingest
+    try:
+        # reusa tu función existente o copia aquí el fetch a MAILHOG_API
+        r = requests.get(MAILHOG_API, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        items_list = data.get("items") or []
+        if not items_list:
+            raise HTTPException(status_code=404, detail="No emails found")
+        msg = items_list[0]
+        from_email = ""
+        if msg.get("From"):
+            from_email = f"{msg['From'].get('Mailbox','')}@{msg['From'].get('Domain','')}"
+        subject = (msg.get("Content", {}).get("Headers", {}).get("Subject", []) or [""])[0]
+        body = msg.get("Content", {}).get("Body", "") or ""
+        parsed = parse_items(body)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"MailHog fetch failed: {e}")
+
+    # 2) Validaciones mínimas
+    missing = []
+    if not parsed:
+        missing.append("items")
+    if not customer_id:
+        missing.append("customer_id")
+
+    # 3) Disponibilidad (si hay items)
+    availability: Dict[str, bool] = {}
+    if parsed:
+        items_payload = [{"sku": it.sku, "qty": it.qty} for it in parsed]
+        # sanity check:
+        if not all(isinstance(x.get("qty"), int) and isinstance(x.get("sku"), str) for x in items_payload):
+            return ProcessResult(
+                status="error",
+                from_email=from_email or "unknown@example.com",
+                subject=subject or "",
+                items=parsed,
+                availability={},
+                reason="Bad payload for inventory.check"
+            )
+
+        try:
+            availability = check_inventory(items_payload)  # debe ser dict[str,bool]
+        except Exception as e:
+            return ProcessResult(
+                status="error",
+                from_email=from_email or "unknown@example.com",
+                subject=subject or "",
+                items=parsed,
+                availability={},
+                reason=f"ERP inventory error: {e}",
+            )
+
+
+        # agrega a missing los SKUs sin stock
+        out_of_stock = [sku for sku, ok in availability.items() if not ok]
+        if out_of_stock:
+            missing.extend([f"stock:{sku}" for sku in out_of_stock])
+
+    # 4) Si hay faltantes → incomplete
+    if missing:
+        return ProcessResult(
+            status="incomplete",
+            from_email=from_email or "unknown@example.com",
+            subject=subject or "",
+            items=parsed,
+            availability=availability,
+            missing=missing
+        )
+
+    # 5) Todo OK → crear quote
+    try:
+        quote_id = create_quote(customer_id, [{"sku": it.sku, "qty": it.qty} for it in parsed])
+        return ProcessResult(
+            status="created",
+            from_email=from_email or "unknown@example.com",
+            subject=subject or "",
+            items=parsed,
+            availability=availability,
+            quote_id=quote_id
+        )
+    except Exception as e:
+        return ProcessResult(
+            status="error",
+            from_email=from_email or "unknown@example.com",
+            subject=subject or "",
+            items=parsed,
+            availability=availability,
+            reason=f"ERP quote error: {e}",
+        )
