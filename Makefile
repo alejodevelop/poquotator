@@ -9,6 +9,13 @@ e2e:
 	# swaks --to test@example.com --from "Alejandro <alejo@test.com>" --server 127.0.0.1:1025 --header "Subject: Quote request" --body "Please quote: 3x Widget A, 5 Widget-B"
 	curl -s http://localhost:8000/ingest | jq
 
+psql:
+	docker compose exec -it db psql -U $$POSTGRES_USER -d $$POSTGRES_DB
+
+db-wipe:
+	docker compose down -v
+	docker system prune -f
+
 logs:
 	docker compose logs -f --tail=200
 

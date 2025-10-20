@@ -4,10 +4,22 @@ from pydantic import BaseModel, Field
 from typing import List, Dict, Optional
 from app.clients.erp import check_inventory_and_pricing, create_quote
 from app.clients.mailer import send_triage_email
+from app.db import init_pool, close_pool, log_event
+from fastapi import Query
 import os, re, requests
+import time
 
 
 app = FastAPI(title="Poquotator API", version="0.1.0")
+
+@app.on_event("startup")
+def _startup():
+    init_pool()
+
+@app.on_event("shutdown")
+def _shutdown():
+    close_pool()
+
 
 # --- Healthcheck ---
 @app.get("/health")
@@ -86,6 +98,7 @@ def process_latest_email(payload: ProcessInput):
     """
     Orquesta: lee último email, parsea items, verifica inventario y crea quote si aplica.
     """
+    t0 = time.perf_counter()
     customer_id = payload.customer_id
     # 1) Reusar la lógica de MailHog que ya tienes en /ingest
     try:
@@ -123,6 +136,21 @@ def process_latest_email(payload: ProcessInput):
         try:
             availability, pricing, currency = check_inventory_and_pricing(items_payload)
         except Exception as e:
+
+            latency = int((time.perf_counter() - t0) * 1000)
+            log_event(
+                from_email=from_email or "unknown@example.com",
+                subject=subject or "",
+                items=[{"sku": it.sku, "qty": it.qty} for it in parsed],
+                availability=availability,
+                pricing=pricing,
+                currency=currency,
+                status="error",
+                missing=None,
+                quote_id=None,
+                latency_ms=latency,
+            )
+
             return ProcessResult(
                 status="error",
                 from_email=from_email or "unknown@example.com",
@@ -154,6 +182,21 @@ def process_latest_email(payload: ProcessInput):
                 customer_id=customer_id,
             )
         except Exception as e:
+
+            latency = int((time.perf_counter() - t0) * 1000)
+            log_event(
+                from_email=from_email or "unknown@example.com",
+                subject=subject or "",
+                items=[{"sku": it.sku, "qty": it.qty} for it in parsed],
+                availability=availability,
+                pricing=pricing,
+                currency=currency,
+                status="incomplete",
+                missing=missing,
+                quote_id=None,
+                latency_ms=latency,
+            )
+
             return ProcessResult(
                 status="incomplete",
                 from_email=from_email or "unknown@example.com",
@@ -180,6 +223,21 @@ def process_latest_email(payload: ProcessInput):
     # 5) Todo OK → crear quote
     try:
         quote_id = create_quote(customer_id, [{"sku": it.sku, "qty": it.qty} for it in parsed])
+
+        latency = int((time.perf_counter() - t0) * 1000)
+        log_event(
+            from_email=from_email or "unknown@example.com",
+            subject=subject or "",
+            items=[{"sku": it.sku, "qty": it.qty} for it in parsed],
+            availability=availability,
+            pricing=pricing,
+            currency=currency,
+            status="created",
+            missing=None,
+            quote_id=quote_id,
+            latency_ms=latency,
+        )
+
         return ProcessResult(
             status="created",
             from_email=from_email or "unknown@example.com",
@@ -200,3 +258,59 @@ def process_latest_email(payload: ProcessInput):
             availability=availability,
             reason=f"ERP quote error: {e}",
         )
+
+
+class MetricsOut(BaseModel):
+    total: int
+    by_status: Dict[str, int]
+    top_missing: List[Dict[str, int]]  # [{"missing":"stock:Widget-B","count":5}, ...]
+    avg_latency_ms: float
+
+@app.get("/metrics", response_model=MetricsOut)
+def metrics(limit_top: int = Query(10, ge=1, le=50)):
+    # Consultas rápidas
+    if _pool is None:
+        init_pool()
+    # Acceso al pool desde módulo db
+    from app.db import _pool as pool  # type: ignore
+
+    total = 0
+    by_status: Dict[str, int] = {}
+    avg_latency_ms = 0.0
+    top_missing: List[Dict[str, int]] = []
+
+    conn = pool.getconn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM events")
+            total = cur.fetchone()[0] or 0
+
+            cur.execute("SELECT status, COUNT(*) FROM events GROUP BY status")
+            by_status = {row[0]: row[1] for row in cur.fetchall()}
+
+            cur.execute("SELECT AVG(latency_ms) FROM events WHERE latency_ms IS NOT NULL")
+            avg = cur.fetchone()[0]
+            avg_latency_ms = float(avg) if avg is not None else 0.0
+
+            # Explota missing_json como array de textos y agrupa
+            cur.execute("""
+                SELECT m.missing, COUNT(*) AS cnt
+                FROM (
+                  SELECT jsonb_array_elements_text(missing_json) AS missing
+                  FROM events
+                  WHERE missing_json IS NOT NULL
+                ) AS m
+                GROUP BY m.missing
+                ORDER BY cnt DESC
+                LIMIT %s
+            """, (limit_top,))
+            top_missing = [{"missing": r[0], "count": r[1]} for r in cur.fetchall()]
+    finally:
+        pool.putconn(conn)
+
+    return MetricsOut(
+        total=total,
+        by_status=by_status,
+        top_missing=top_missing,
+        avg_latency_ms=round(avg_latency_ms, 2),
+    )
